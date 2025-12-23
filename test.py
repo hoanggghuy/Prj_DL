@@ -7,7 +7,7 @@ import sys
 
 MODEL_PATH = 'face_model.pth'
 LABELS_FILE = 'labels.txt'
-IMAGE_PATH = '4.jfif'
+IMAGE_PATH = '1.jpg'
 CONFIDENCE_THRESHOLD = 70.0
 
 
