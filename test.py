@@ -4,97 +4,149 @@ from torchvision import models, transforms
 from PIL import Image
 import os
 import sys
+import time
+from dataclasses import dataclass
+from typing import List, Tuple
 
-MODEL_PATH = 'face_model.pth'
-LABELS_FILE = 'labels.txt'
-IMAGE_PATH = '1.jpg'
-CONFIDENCE_THRESHOLD = 70.0
+@dataclass
+class SystemConfig:
+    model_path: str = 'face_model.pth'
+    labels_path: str = 'labels.txt'
+    confidence_threshold: float = 70.0
+    input_size: Tuple[int, int] = (224, 224)
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+class FaceRecognizer:
+    def __init__(self, config: SystemConfig):
+        self.cfg = config
+        print(f"Initializing system on: {self.cfg.device.upper()}")
+        
+        self.labels = self._load_labels()
+        self.model = self._load_model()
+        self.transform = self._get_transforms()
+        
+        self._warmup_gpu()
 
-def load_labels(label_path):
-    if not os.path.exists(label_path):
-        print(f"Error: File '{label_path}' not found. Please run main.py first.")
-        sys.exit(1)
+    def _load_labels(self) -> List[str]:
+        if not os.path.exists(self.cfg.labels_path):
+            raise FileNotFoundError(f"Missing labels file: {self.cfg.labels_path}")
+        with open(self.cfg.labels_path, 'r') as f:
+            return [line.strip() for line in f.readlines()]
 
-    with open(label_path, 'r') as f:
-        class_names = [line.strip() for line in f.readlines()]
-    return class_names
+    def _load_model(self) -> nn.Module:
+        if not os.path.exists(self.cfg.model_path):
+            raise FileNotFoundError(f"Missing model file: {self.cfg.model_path}")
 
+        print(f"Loading model weights from {self.cfg.model_path}...")
+        try:
+            model = models.mobilenet_v2(weights=None)
+            model.classifier[1] = nn.Linear(model.last_channel, len(self.labels))
+            
+            state_dict = torch.load(self.cfg.model_path, map_location=self.cfg.device)
+            model.load_state_dict(state_dict)
+            model.to(self.cfg.device)
+            model.eval()
+            return model
+        except Exception as e:
+            raise RuntimeError(f"Failed to load model: {e}")
 
-def load_model(model_path, num_classes):
-    print(f"Loading model from: {model_path}")
+    def _get_transforms(self) -> transforms.Compose:
+        return transforms.Compose([
+            transforms.Resize(self.cfg.input_size),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        ])
 
-    model = models.mobilenet_v2(pretrained=False)
-    model.classifier[1] = nn.Linear(model.last_channel, num_classes)
+    def _warmup_gpu(self):
+        print("Warming up GPU kernels...")
+        dummy_input = torch.randn(1, 3, *self.cfg.input_size).to(self.cfg.device)
+        with torch.no_grad():
+            self.model(dummy_input)
+        print("System Ready!")
 
-    if not os.path.exists(model_path):
-        print(f"Error: Model file '{model_path}' not found")
-        sys.exit(1)
+    def predict(self, image_path: str) -> Tuple[str, float, float]:
+        if not os.path.exists(image_path):
+            raise FileNotFoundError(f"Image not found: {image_path}")
 
-    try:
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-    except RuntimeError as e:
-        print(f"Error: Model architecture mismatch. Details: {e}")
-        sys.exit(1)
+        try:
+            image = Image.open(image_path).convert('RGB')
+            input_tensor = self.transform(image).unsqueeze(0).to(self.cfg.device)
+        except Exception as e:
+            raise ValueError(f"Invalid image format: {e}")
 
-    model.eval()
-    return model
+        start_time = time.time()
+        
+        with torch.no_grad():
+            outputs = self.model(input_tensor)
+            
+            if torch.isnan(outputs).any():
+                outputs = torch.nan_to_num(outputs, nan=0.0)
 
+            probs = torch.nn.functional.softmax(outputs[0], dim=0)
+            conf, idx = torch.max(probs, 0)
 
-def process_image(image_path):
-    if not os.path.exists(image_path):
-        print(f"Error: Image '{image_path}' not found")
-        sys.exit(1)
+        end_time = time.time()
+        inference_time_ms = (end_time - start_time) * 1000
+        
+        confidence_pct = conf.item() * 100
+        predicted_label = self.labels[idx.item()]
 
-    transform = transforms.Compose([
-        transforms.Resize((224, 224)),
-        transforms.ToTensor(),
-        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
-    ])
+        return predicted_label, confidence_pct, inference_time_ms
 
-    try:
-        image = Image.open(image_path).convert('RGB')
-        input_tensor = transform(image)
-        input_tensor = input_tensor.unsqueeze(0)
-        return input_tensor
-    except Exception as e:
-        print(f"Error reading image: {e}")
-        sys.exit(1)
-
+def clean_path(path_str: str) -> str:
+    return path_str.strip().strip("'").strip('"')
 
 def main():
-    class_names = load_labels(LABELS_FILE)
-    num_classes = len(class_names)
-    print(f"Classes ({num_classes} people): {class_names}")
+    config = SystemConfig()
+    
+    try:
+        engine = FaceRecognizer(config)
+    except Exception as e:
+        print(f"Critical Error during initialization: {e}")
+        sys.exit(1)
 
-    model = load_model(MODEL_PATH, num_classes)
+    print("\n" + "="*60)
+    print("       INTERACTIVE FACE RECOGNITION")
+    print("="*60)
+    print(f"Classes: {engine.labels}")
+    print("Type 'q' or 'exit' to quit.\n")
 
-    input_tensor = process_image(IMAGE_PATH)
+    while True:
+        try:
+            user_input = input(">> Image Path: ")
+            
+            if user_input.lower() in ['q', 'exit', 'quit']:
+                print("Exiting system...")
+                break
+            
+            if not user_input.strip():
+                continue
 
-    print("-" * 30)
-    print(f"Classifying image: {IMAGE_PATH} ...")
+            clean_input = clean_path(user_input)
+            
+            try:
+                label, conf, t_ms = engine.predict(clean_input)
+                
+                if conf < config.confidence_threshold:
+                    display_label = "UNKNOWN PERSON"
+                else:
+                    display_label = label
 
-    with torch.no_grad():
-        outputs = model(input_tensor)
-        probabilities = torch.nn.functional.softmax(outputs[0], dim=0)
-        top_prob, top_idx = torch.max(probabilities, 0)
+                print("-" * 50)
+                print(f"File:       {os.path.basename(clean_input)}")
+                print(f"Result:     {display_label}")
+                print(f"Confidence: {conf:.2f}%")
+                print(f"Latency:    {t_ms:.2f} ms")
+                print("-" * 50)
 
-        confidence = top_prob.item() * 100
+            except FileNotFoundError:
+                print("Error: File does not exist.")
+            except ValueError as ve:
+                print(f"Error: {ve}")
 
-        if confidence > CONFIDENCE_THRESHOLD:
-            predicted_class = class_names[top_idx.item()]
-        else:
-            predicted_class = "Unknown person"
-
-    print(f"==> RESULT: {predicted_class}")
-    print(f"==> CONFIDENCE: {confidence:.2f}%")
-    print("-" * 30)
-
-    print("Probability details:")
-    for i, name in enumerate(class_names):
-        prob = probabilities[i].item() * 100
-        print(f" - {name}: {prob:.2f}%")
-
+        except KeyboardInterrupt:
+            print("\nForced Stop.")
+            break
 
 if __name__ == "__main__":
     main()
